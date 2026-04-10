@@ -2,8 +2,16 @@
 # Launcher for EVS capture script on OpenSUSE Leap 16
 # Sets LD_LIBRARY_PATH to the extracted ArenaSDK libraries and activates the venv.
 
-SDK=/home/charalambos/Downloads/ArenaSDK_Linux_x64
-RDMA=/home/charalambos/Downloads/rdma_libs/usr/lib64
+SDK=${ARENA_SDK:-$HOME/Downloads/ArenaViewMP_v_1.0.0.10_Linux_x64/ArenaSDK_Linux_x64}
+RDMA=${RDMA_LIBS:-$HOME/rdma_libs/usr/lib64}
+
+if [ ! -d "$SDK" ]; then
+    echo "ERROR: ArenaSDK not found at $SDK"
+    echo "Download it from https://thinklucid.com/downloads-hub/"
+    echo "Extract it and either place it at ~/ArenaSDK_Linux_x64"
+    echo "or set ARENA_SDK=/path/to/ArenaSDK_Linux_x64"
+    exit 1
+fi
 
 export LD_LIBRARY_PATH=\
 $SDK/lib64:\

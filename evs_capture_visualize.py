@@ -28,6 +28,7 @@ import time
 import os
 import numpy as np
 import cv2
+import dv_processing as dv
 
 from arena_api.system import system
 from arena_api.buffer import BufferFactory
@@ -55,8 +56,20 @@ DENOISE_KERNEL  = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))
 # XYTPFrame: dilate each event point into a small dot so sparse events are visible
 DILATE_KERNEL   = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (4, 4))
 
-MODE_CDFRAME   = "CDFrame"
-MODE_XYTPFRAME = "XYTPFrame"
+MODE_CDFRAME      = "CDFrame"
+MODE_XYTPFRAME    = "XYTPFrame"
+MODE_DV_EVENTS    = "DV-Events"
+MODE_DV_ACCUMULATOR = "DV-Accumulator"
+MODE_DV_TIMESURFACE = "DV-TimeSurface"
+
+ALL_MODES = [MODE_CDFRAME, MODE_XYTPFRAME, MODE_DV_EVENTS, MODE_DV_ACCUMULATOR, MODE_DV_TIMESURFACE]
+
+# Modes that require XYTPFrame data from the camera (per-event x,y,t,p)
+XYTP_MODES = {MODE_XYTPFRAME, MODE_DV_EVENTS, MODE_DV_ACCUMULATOR, MODE_DV_TIMESURFACE}
+
+# dv-processing noise filter duration (microseconds) — events without
+# neighbours within this window are considered background noise
+DV_NOISE_DURATION_US = 2000
 
 # ---------------------------------------------------------------------------
 # Device helpers
