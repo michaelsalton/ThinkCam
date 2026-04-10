@@ -1,0 +1,4 @@
+numpy>=1.19.4
+opencv-python>=4.5
+dv-processing>=2.0
+PySide6>=6.5

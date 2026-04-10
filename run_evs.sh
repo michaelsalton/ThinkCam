@@ -23,4 +23,12 @@ $RDMA:\
 /tmp/usr/lib64
 
 source ~/envs/default/bin/activate
-python3 "$(dirname "$0")/evs_capture_visualize.py" "$@"
+
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+
+if [ "$1" = "--cli" ]; then
+    shift
+    python3 "$SCRIPT_DIR/evs_capture_visualize.py" "$@"
+else
+    python3 -m thinkcam.main "$@"
+fi
