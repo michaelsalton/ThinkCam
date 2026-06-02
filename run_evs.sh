@@ -2,8 +2,8 @@
 # Launcher for EVS capture script on OpenSUSE Leap 16
 # Sets LD_LIBRARY_PATH to the extracted ArenaSDK libraries and activates the venv.
 
-SDK=${ARENA_SDK:-$HOME/Downloads/ArenaViewMP_v_1.0.0.10_Linux_x64/ArenaSDK_Linux_x64}
-RDMA=${RDMA_LIBS:-$HOME/rdma_libs/usr/lib64}
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+SDK=${ARENA_SDK:-$SCRIPT_DIR/ArenaSDK/ArenaSDK_Linux_x64}
 
 if [ ! -d "$SDK" ]; then
     echo "ERROR: ArenaSDK not found at $SDK"
@@ -15,20 +15,13 @@ fi
 
 export LD_LIBRARY_PATH=\
 $SDK/lib64:\
-$SDK/OpenCV/lib:\
 $SDK/GenICam/library/lib/Linux64_x64:\
 $SDK/Metavision/lib:\
-$SDK/ffmpeg:\
-$RDMA:\
-/tmp/usr/lib64
+$SDK/ffmpeg
+
+# GenTL producer for LUCID cameras (skips the need for sudo Arena_SDK.conf -cti)
+export GENICAM_GENTL64_PATH=$SDK/lib64${GENICAM_GENTL64_PATH:+:$GENICAM_GENTL64_PATH}
 
 source ~/envs/default/bin/activate
 
-SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-
-if [ "$1" = "--cli" ]; then
-    shift
-    python3 "$SCRIPT_DIR/evs_capture_visualize.py" "$@"
-else
-    python3 -m thinkcam.main "$@"
-fi
+python3 -m thinkcam.main "$@"

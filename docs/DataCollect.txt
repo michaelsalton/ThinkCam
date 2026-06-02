@@ -1,0 +1,401 @@
+# ThinkCam → Event-3DGS Reconstruction: Implementation Guide
+
+This document is a build spec for an implementing agent (Claude Code). It describes
+how to extend the **ThinkCam** capture tool (`github.com/michaelsalton/ThinkCam`) so
+that it records **raw event streams** suitable for two event-based 3D reconstruction
+pipelines, and how to convert those recordings into each pipeline's expected dataset
+format.
+
+Camera: **LUCID TRT009S-E** (Triton EVS, Sony IMX636 sensor, expected 1280×720 —
+confirm from the camera/`constants.py` rather than hardcoding).
+
+Target pipelines:
+- **IncEventGS** — `github.com/WU-CVGL/IncEventGS` (pose-free 3DGS from a single event camera)
+- **Event-3DGS** — `github.com/lanpokn/Event-3DGS` (event-based 3DGS built on vanilla 3DGS)
+
+---
+
+## 0. Read this before writing any code
+
+The current ThinkCam only exports **PNG snapshots and MP4 video** (rendered
+visualizations of events). That is lossy and unusable as reconstruction input — both
+target pipelines consume the **raw asynchronous event stream** `(x, y, t, polarity)`,
+not pictures of events. The core job of this work is to add a lossless raw-event
+recorder and the two format converters.
+
+**Do not trust function/class names invented in this spec.** I do not have the live
+source of every ThinkCam module. Before editing, *read the actual files* and integrate
+against what exists. The spec defines the integration **contract** (where to tap the
+stream, what to write, what to expose in the UI), not exact line edits.
+
+**`VERIFY-FIRST` callouts** mark places where a downstream repo's exact convention
+(array column order, polarity encoding, timestamp units, config schema) must be
+confirmed by reading that repo's loader code before finalizing. These were inferred
+from READMEs and must not be hardcoded blind.
+
+---
+
+## 1. Deliverables
+
+1. A **raw event recorder** in ThinkCam writing AEDAT4 (primary) and HDF5 (portable).
+2. A **metadata sidecar** JSON written alongside every raw recording.
+3. A **converter** from a ThinkCam raw recording → IncEventGS dataset layout.
+4. A **converter** from a ThinkCam raw recording → Event-3DGS dataset layout.
+5. Updated **README/usage** docs and a short **operator capture checklist** (Section 6).
+
+Priority order: 1 → 2 → 3 → (4 last; it has heavy external dependencies). The operator
+needs items 1–3 working before the next capture session; item 4 can follow.
+
+---
+
+## 2. Repo orientation (read these first)
+
+Known module map (from the ThinkCam README — confirm against the tree):
+
+```
+thinkcam/
+  main.py          # entry point
+  main_window.py   # window layout + signal wiring
+  camera_worker.py # QThread doing camera acquisition  <-- event stream originates here
+  visualizer.py    # frame rendering (5 modes)
+  controls.py      # sidebar control panel             <-- add Record-RAW control here
+  status_bar.py    # live statistics                   <-- add raw-record stats here
+  recorder.py      # MP4 recording                      <-- add raw recorder beside this
+  constants.py     # config + defaults                  <-- add raw-record defaults here
+evs_capture_visualize.py  # legacy standalone CLI viewer
+run_evs.sh
+```
+
+Stack: **PySide6**, **OpenCV**, **dv-processing** (`dv_processing` /  imported as `dv`),
+**arena_api** (LUCID ArenaSDK Python wheel).
+
+**Integration contract — find this first:** in `camera_worker.py`, locate the point in
+the acquisition loop where each batch of events is available as a **`dv.EventStore`**
+(this is what feeds the visualizer). That object — *before* it is rendered to a frame —
+is the tap point for the raw recorder. The recorder must receive the same EventStore
+batches the visualizer receives, losslessly.
+
+---
+
+## 3. Deliverable 1 — Raw event recorder
+
+### 3.1 Requirements
+
+- Record the raw event stream **losslessly**. Never downsample, never go through a
+  rendered frame.
+- **Must not drop events** and **must not block acquisition.** Camera acquisition runs
+  in a QThread; file I/O must not stall it. Use a bounded queue + a dedicated writer
+  thread (or dv-processing's own buffered writer), and surface a dropped-event counter
+  if the queue ever saturates (it should not under normal rates).
+- Two output formats, selectable in `constants.py` / UI:
+  - **AEDAT4** (primary) — native to dv-processing, lossless, replayable in ThinkCam itself.
+  - **HDF5** (portable) — for the converters and for sharing.
+- Recording is **independent** of MP4 recording. The operator may run raw-only,
+  MP4-only, both, or neither.
+- Each recording writes to a session directory:
+  `recordings/<YYYYmmdd_HHMMSS>_<label>/` containing the event file + metadata sidecar
+  (Section 3.6). `<label>` is an optional operator-supplied take name.
+
+### 3.2 Format A — AEDAT4 (primary)
+
+Use dv-processing's writer. Realistic API (confirm signatures against the installed
+`dv_processing` version):
+
+```python
+import dv_processing as dv
+
+# resolution from the camera, not hardcoded
+config = dv.io.MonoCameraWriter.Config("TRT009S-E")   # name/string per installed API
+config.addEventStream((width, height))
+writer = dv.io.MonoCameraWriter(out_path_aedat4, config)
+
+# in the writer thread, per batch:
+writer.writeEvents(event_store)   # event_store is the dv.EventStore from camera_worker
+```
+
+- Preserve original sensor timestamps (microseconds). Do **not** re-clock to wall time.
+- On stop, flush/close cleanly so the file is valid even if a take is cut short.
+
+### 3.3 Format B — HDF5 (portable)
+
+Write one HDF5 file per recording with **separate chunked datasets** (most portable for
+the converters and for streaming reads):
+
+```
+events.h5
+  /events/x   uint16   # column (0..width-1)
+  /events/y   uint16   # row    (0..height-1)
+  /events/t   int64    # timestamp in MICROSECONDS, monotonic, sensor clock
+  /events/p   int8     # polarity, stored as {0,1}; record the convention in metadata
+  attrs: width, height, polarity_encoding="0/1", t_unit="us", sensor="IMX636"
+```
+
+- Use chunking (e.g. 1e6 along the event axis) + gzip/lz4 so long takes stay manageable.
+- Append from the writer thread in blocks; do not hold the entire take in RAM.
+- Keep `x,y,t,p` as **four parallel 1-D arrays** of equal length (not a compound dtype) —
+  the converters expect to slice these directly.
+
+### 3.4 GUI wiring
+
+- In `controls.py`: add a **"Record RAW"** toggle (and a take-label text field).
+  Distinct from the existing MP4 record control.
+- In `status_bar.py`: while recording, show **elapsed time, total events written,
+  current event rate, output file size**, and a **dropped-events** counter (should stay 0).
+- In `main_window.py`: wire the toggle signal to start/stop the recorder; ensure stopping
+  flushes and closes both the event file and the metadata sidecar.
+- Keyboard shortcut: add e.g. **`R`** to toggle raw recording (document it; `S`/`Q`/`Esc`
+  already exist).
+
+### 3.5 Metadata sidecar (Deliverable 2)
+
+Write `metadata.json` in the session directory at **stop** (so final counts are known):
+
+```json
+{
+  "sensor": "Sony IMX636 (LUCID TRT009S-E)",
+  "resolution": [1280, 720],
+  "timestamp_unit": "us",
+  "polarity_encoding": "0/1",
+  "recording_start_utc": "2026-06-01T09:14:03Z",
+  "duration_s": 47.2,
+  "event_count": 51234567,
+  "biases": {
+    "threshold": null,
+    "refractory_period": null,
+    "burst_filter": null
+  },
+  "noise_filter": {
+    "background_activity_filter": true,
+    "duration_us": null
+  },
+  "intrinsics": {
+    "fx": null, "fy": null, "cx": null, "cy": null,
+    "distortion": null,
+    "calibrated": false
+  },
+  "operator_notes": "",
+  "take_label": "phantom_orbit_01"
+}
+```
+
+Pull `biases` and `noise_filter` values from ThinkCam's live control state (these are
+the same hardware bias / dv filter settings already exposed in the UI). `intrinsics`
+may be null at capture time and filled in after calibration — leave the fields present.
+This sidecar is what makes a recording reproducible and is read by the converters.
+
+### 3.6 Acceptance tests (recorder)
+
+- Record a short take of a moving scene. Re-open the AEDAT4 in ThinkCam (or
+  `dv.io.MonoCameraRecording`) and confirm playback matches.
+- Load the HDF5; assert `len(x)==len(y)==len(t)==len(p)`, `t` is non-decreasing, `x<width`,
+  `y<height`, `p ∈ {0,1}`.
+- Confirm event count in `metadata.json` equals HDF5 array length.
+- Stress: record several minutes at high event rate; confirm dropped-events counter is 0
+  and acquisition frame rate in the status bar does not degrade.
+- Cut a take mid-recording (hard stop); confirm both files are still valid/readable.
+
+---
+
+## 4. Deliverable 3 — Converter to IncEventGS
+
+IncEventGS is **pose-free**: for reconstructing the operator's own scene it needs only
+the event stream. Poses and reference images in its dataset layout are **ground-truth
+for evaluation only** and are NOT required to train on a custom capture.
+
+### 4.1 Target layout (from the IncEventGS README)
+
+```
+<scene_name>/
+├── poses_ts.txt              # eval-only; optional for custom capture
+├── traj.txt                  # eval-only; 4x4 matrices flattened row-major (16 floats/line)
+├── images/                   # eval-only reference frames; optional for custom capture
+│   └── frameNNNNNN.jpg
+└── event_threshold_0.1/
+    └── gray_events_data.npy  # REQUIRED — the event array
+```
+
+The converter's required output is `event_threshold_<C>/gray_events_data.npy`. Generate
+the directory skeleton; write `traj.txt`/`poses_ts.txt`/`images/` only if the operator
+supplies poses (they normally won't for a first capture — emit a note that training
+proceeds without them).
+
+The `<C>` in `event_threshold_<C>` is the assumed per-event **contrast threshold**.
+Pick/parameterize it to roughly match the camera's actual threshold/bias from
+`metadata.json`; default `0.1` to match their sample data.
+
+### 4.2 `VERIFY-FIRST` — the `.npy` schema
+
+Read `IncEventGS/datasets/` (the dataset loader) and confirm, before finalizing, the
+**exact** layout of `gray_events_data.npy`:
+
+- **Column order** — `[t, x, y, p]` vs `[x, y, t, p]` (do not assume).
+- **Timestamp unit** — seconds vs microseconds. Their pipeline integrates over time
+  windows; the sample data is derived from TUMVIE (µs source) but may be rescaled to
+  seconds on load. Match what the loader expects.
+- **Polarity encoding** — `{0,1}` vs `{-1,1}`.
+- **dtype** — likely `float64`/`float32` for a single N×4 array (so timestamps and
+  coordinates share a dtype), but confirm.
+
+Make all four configurable via CLI flags with documented defaults, and print the chosen
+convention at runtime. After confirming from the loader, set the defaults accordingly
+and note the verified convention in a comment.
+
+### 4.3 Implementation
+
+```
+convert_to_inceventgs.py
+  --input   recordings/<session>/events.h5   (or .aedat4)
+  --out     datasets/<scene_name>
+  --threshold 0.1
+  --col-order txyp|xytp           (default per VERIFY-FIRST)
+  --t-unit  us|s                  (default per VERIFY-FIRST)
+  --polarity 01|pm1               (default per VERIFY-FIRST)
+```
+
+Steps:
+1. Read events from HDF5 (or AEDAT4 via `dv.io.MonoCameraRecording` → arrays).
+2. Re-encode polarity / rescale timestamps / reorder columns per flags.
+3. Stack into the N×K array and `np.save` to
+   `<out>/event_threshold_<C>/gray_events_data.npy`.
+4. Create the empty `images/` dir and skeleton `traj.txt`/`poses_ts.txt` only if poses
+   provided; otherwise skip and log that pose-free training needs nothing more.
+5. Write/copy intrinsics into the place IncEventGS reads them — **`VERIFY-FIRST`**: check
+   whether intrinsics live in the dataset dir or in the run `configs/*.yaml`. The README
+   runs via `python main.py --config configs/SimuEvent/replica_room0.yaml`, so likely the
+   YAML. Emit a ready-to-edit config stub with the camera's `width,height,fx,fy,cx,cy`
+   filled from `metadata.json`.
+
+### 4.4 Acceptance tests (IncEventGS converter)
+
+- Load the produced `.npy`; assert shape `(N, K)`, dtype, and that value ranges match the
+  chosen conventions (x<width, y<height, t monotonic, polarity set correct).
+- Round-trip a tiny synthetic event set through the converter and back; assert no loss.
+- Dry-run the IncEventGS dataloader (import its dataset class, point it at the output dir)
+  and confirm it loads without shape/dtype errors **before** the operator relies on it.
+
+---
+
+## 5. Deliverable 4 — Converter to Event-3DGS (lanpokn)
+
+This pipeline is built on **vanilla 3DGS**, so it needs a COLMAP `sparse/` model and
+image folders — but the images are **intensity frames reconstructed from events**, not
+raw events and not RGB.
+
+### 5.1 Target layout (from the Event-3DGS README)
+
+```
+/path/to/dataset/
+├── images/          # intensity images estimated from events (supply absolute intensity)
+├── images_event/    # intensity images estimated from events (supply intensity *differences*)
+├── images_blurry/   # optional
+├── renders/
+└── sparse/          # COLMAP model: cameras, images, points3D (poses + sparse points)
+```
+
+### 5.2 `VERIFY-FIRST` — use the repo's own preprocessing
+
+Before building anything, read the Event-3DGS repo for **provided preprocessing
+scripts**. It mentions a high-pass-filter photovoltage estimation module for producing
+intensity from events; there may be a script that generates `images/` and
+`images_event/` directly. **Prefer the repo's own tooling** over a generic reimplementation —
+match exactly how it derives the two image sets (they differ: absolute intensity vs
+intensity-difference) and how it expects them indexed/timestamped.
+
+### 5.3 Pipeline (if repo tooling must be supplemented)
+
+1. **Events → intensity frames.** Convert the raw stream to a sequence of intensity
+   images at chosen timestamps. Either the repo's photovoltage module, or an
+   event-to-video reconstructor (E2VID / FireNet family). Produce `images/` (absolute
+   intensity) and `images_event/` (the difference-style images the repo specifies).
+   `VERIFY-FIRST`: how the repo distinguishes / generates these two.
+2. **COLMAP → `sparse/`.** Run COLMAP feature extraction + matching + mapping on the
+   reconstructed intensity frames to get poses and a sparse point cloud, in standard
+   COLMAP `sparse/0/{cameras,images,points3D}.bin`.
+   - COLMAP needs **parallax** — this is why the capture must *translate*, not just rotate
+     (Section 6). Pure rotation will fail to triangulate.
+   - COLMAP on event-reconstructed frames can be fragile. If it fails, fall back to poses
+     from a co-mounted RGB camera (out of scope for tomorrow; note it for later).
+3. **Assemble** the directory and seed `renders/` as the repo expects.
+
+### 5.4 Acceptance tests (Event-3DGS converter)
+
+- Confirm `images/` and `images_event/` counts match and are time-aligned.
+- Confirm COLMAP `sparse/` registers a large fraction of frames (low registration = bad
+  capture or bad intensity reconstruction; report the number).
+- Dry-run the Event-3DGS dataloader against the assembled dir before relying on it.
+
+---
+
+## 6. Operator capture protocol (human-facing — include in README)
+
+The scene is a **surgical scene** (instruments, anatomical parts/phantom). Both pipelines
+assume a **static scene with a moving camera**. Anything that moves in the scene is
+interpreted as geometry and corrupts both structure and pose.
+
+**Golden rule:** arrange the scene, then **nobody touches anything** while a take rolls.
+Only the camera moves.
+
+Session steps:
+1. **Lock the scene.** Position instruments/phantom. Fix lens **focus** on the site and
+   don't touch it (fixed-focus optics; out-of-focus edges = junk events).
+2. **Lighting:** bright, diffuse, **flicker-free**. Verify no flicker in ThinkCam's
+   TimeSurface/Accumulator view. Lights and shadows must **not move** during a take.
+3. **Tune biases** on the live preview until edges are clean (not a noise snowstorm, not
+   near-empty). **Write the bias values down** — the IncEventGS `event_threshold` should
+   roughly match them.
+4. **Motion = orbit WITH translation.** Keep the site centered; arc the camera around it
+   at a roughly constant radius, **continuous and smooth**, moderate speed. You need
+   parallax (real travel around the object), not in-place panning. Record each orbit as
+   **one continuous take** (no stop-start).
+5. **Coverage:** several passes at different elevations (low / eye-level / top-down),
+   overlapping. ~150–180° of access is fine if a full 360° isn't possible. Prefer a few
+   20–60 s takes over one long one.
+6. **Verify before teardown:** after the first take, check the live view for dense, clean
+   events across the *whole* site. Dead regions = too low-contrast; add light/texture and redo.
+
+Surgical-scene specifics:
+- **Shiny instruments:** specular glints slide with the camera and register as phantom
+  events → tools smear/halo. Diffuse the lighting, angle tools to kill direct glints,
+  and expect metal regions to be the weakest part of the reconstruction.
+- **Living tissue/people:** breathing and micro-motion corrupt static reconstruction.
+  Strongly prefer a **phantom / anatomical model**. If a person is unavoidable, shoot
+  short takes during a held breath.
+- **A recording of the live procedure is NOT valid input** for these two pipelines (they
+  are static-scene methods). Capture that separately only if you later pursue a dynamic /
+  4D method; do not mix it into the reconstruction dataset.
+
+Always log per take: bias settings, chosen threshold, approximate camera distance/radius,
+lighting, and whether intrinsics were calibrated.
+
+---
+
+## 7. Usage summary (to document in README once built)
+
+```
+# capture (GUI): toggle "Record RAW" (or press R); takes land in recordings/<ts>_<label>/
+./run_evs.sh
+
+# convert one take for IncEventGS (pose-free)
+python convert_to_inceventgs.py \
+    --input recordings/<session>/events.h5 \
+    --out datasets/<scene_name> --threshold 0.1
+
+# convert one take for Event-3DGS (events -> intensity frames -> COLMAP -> sparse/)
+python convert_to_event3dgs.py \
+    --input recordings/<session>/events.h5 \
+    --out datasets/<scene_name>
+```
+
+---
+
+## 8. Final verification checklist (confirm against the real repos, not this doc)
+
+- [ ] ThinkCam `camera_worker.py`: exact object/type carrying events (assumed `dv.EventStore`).
+- [ ] dv-processing version + `MonoCameraWriter` / `MonoCameraRecording` API signatures.
+- [ ] Camera resolution + how biases/noise-filter settings are read from UI state.
+- [ ] IncEventGS `gray_events_data.npy`: column order, timestamp unit, polarity encoding, dtype.
+- [ ] IncEventGS intrinsics location (dataset dir vs run YAML) + expected field names.
+- [ ] Event-3DGS: provided preprocessing scripts; how `images/` vs `images_event/` are produced.
+- [ ] Event-3DGS: exact COLMAP `sparse/` layout/version it expects.
+- [ ] Both: run each repo's dataloader against converter output as a smoke test before the operator depends on it.
+```

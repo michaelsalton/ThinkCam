@@ -17,12 +17,15 @@ venv/
 *.swp
 *.swo
 
-# Captures & recordings
+# Captures & recordings (binary data artifacts — regenerable, kept out of git)
 evs_captures/
+recordings/
+datasets/
 
 # OS
 .DS_Store
 Thumbs.db
 
 # ArenaSDK (local install, not part of repo)
+ArenaSDK/
 ArenaSDK_*/

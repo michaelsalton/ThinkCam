@@ -1,6 +1,6 @@
+import ctypes
 import time
 
-import cv2
 import numpy as np
 from PySide6.QtCore import QMutex, QMutexLocker, QThread, Signal
 
@@ -12,18 +12,13 @@ from thinkcam.constants import (
     BIAS_THRESHOLD_POS,
     BURST_FILTER_ENABLE,
     CAMERA_IP,
+    DISPLAY_FPS,
     ERC_RATE_LIMIT_MEV,
+    EVS_OUTPUT_FORMAT,
     IMAGE_TIMEOUT_MS,
-    MODE_CDFRAME,
-    MODE_XYTPFRAME,
     NUM_BUFFERS,
-    XYTP_MODES,
 )
-from thinkcam.visualizer import EventVisualizer
-
-
-def _camera_mode_for(display_mode: str) -> str:
-    return MODE_XYTPFRAME if display_mode in XYTP_MODES else MODE_CDFRAME
+from thinkcam.visualizer import render_events
 
 
 class CameraWorker(QThread):
@@ -36,50 +31,14 @@ class CameraWorker(QThread):
         super().__init__(parent)
         self._lock = QMutex()
         self._running = False
-
-        # Parameters (read under lock by the worker)
-        self._mode = MODE_CDFRAME
-        self._colormap = cv2.COLORMAP_JET
-        self._sw_noise = True
-        self._noise_duration_us = 2000
-        self._pending_bias: dict | None = None
-        self._mode_changed = False
-
-    # ------------------------------------------------------------------
-    # Thread-safe setters (called from GUI thread)
-    # ------------------------------------------------------------------
-
-    def set_mode(self, mode: str):
-        with QMutexLocker(self._lock):
-            if mode != self._mode:
-                self._mode = mode
-                self._mode_changed = True
-
-    def set_colormap(self, colormap_id: int):
-        with QMutexLocker(self._lock):
-            self._colormap = colormap_id
-
-    def set_sw_noise(self, enabled: bool):
-        with QMutexLocker(self._lock):
-            self._sw_noise = enabled
-
-    def set_noise_duration(self, us: int):
-        with QMutexLocker(self._lock):
-            self._noise_duration_us = us
-
-    def set_bias(self, node_name: str, value):
-        with QMutexLocker(self._lock):
-            if self._pending_bias is None:
-                self._pending_bias = {}
-            self._pending_bias[node_name] = value
+        # Set by MainWindow. The recorder is thread-safe (its own queue/lock),
+        # so the acquisition loop can submit batches directly without going
+        # through Qt signals — keeps high-rate event data off the GUI thread.
+        self.raw_recorder = None
 
     def stop(self):
         with QMutexLocker(self._lock):
             self._running = False
-
-    # ------------------------------------------------------------------
-    # Camera helpers
-    # ------------------------------------------------------------------
 
     def _connect_device(self, max_tries=6, wait_secs=10):
         system.DEVICE_INFOS_TIMEOUT_MILLISEC = 1000
@@ -94,7 +53,7 @@ class CameraWorker(QThread):
             time.sleep(wait_secs)
         return None
 
-    def _configure_evs(self, device, cam_mode: str) -> dict:
+    def _configure_evs(self, device) -> dict:
         nm = device.nodemap
         tl = device.tl_stream_nodemap
 
@@ -110,12 +69,10 @@ class CameraWorker(QThread):
         nm["EventFormat"].value = "EVT3_0"
         nm["ErcEnable"].value = True
         nm["ErcRateLimit"].value = ERC_RATE_LIMIT_MEV
-        tl["StreamEvsOutputFormat"].value = cam_mode
+        tl["StreamEvsOutputFormat"].value = EVS_OUTPUT_FORMAT
 
-        if cam_mode == MODE_CDFRAME:
-            fps = tl["StreamFrameGeneratorFPS"].value
-            accum_us = int(1_000_000 / fps)
-            tl["StreamFrameGeneratorAccumTime"].value = accum_us
+        fps = tl["StreamFrameGeneratorFPS"].value
+        tl["StreamFrameGeneratorAccumTime"].value = int(1_000_000 / fps)
 
         return saved
 
@@ -137,6 +94,23 @@ class CameraWorker(QThread):
                 pass
         return saved
 
+    @staticmethod
+    def _decode_xytp(buffer) -> np.ndarray:
+        """Copy a LUCID_LucidXYTP128f buffer into an (N, 4) float32 array.
+
+        Each fired pixel is 4x float32 (x, y, t, p); only pixels that had an
+        event are present (size_filled, not width*height). The copy is required
+        because the buffer is requeued to the camera immediately after.
+        """
+        bytes_per_event = max(1, buffer.bits_per_pixel // 8)  # 16 for 128f
+        n = buffer.size_filled // bytes_per_event
+        if n == 0:
+            return np.empty((0, 4), dtype=np.float32)
+        raw = (ctypes.c_float * (n * 4)).from_address(
+            ctypes.addressof(buffer.pbytes)
+        )
+        return np.frombuffer(raw, dtype=np.float32).reshape(n, 4).copy()
+
     def _restore_settings(self, device, *saved_dicts):
         nm = device.nodemap
         for saved in saved_dicts:
@@ -146,18 +120,6 @@ class CameraWorker(QThread):
                 except Exception:
                     pass
 
-    def _apply_pending_bias(self, device, pending: dict):
-        nm = device.nodemap
-        for node_name, value in pending.items():
-            try:
-                nm[node_name].value = value
-            except Exception as e:
-                self.status_message.emit(f"Bias error: {node_name}: {e}")
-
-    # ------------------------------------------------------------------
-    # Main loop
-    # ------------------------------------------------------------------
-
     def run(self):
         self._running = True
         devices = self._connect_device()
@@ -165,7 +127,9 @@ class CameraWorker(QThread):
             self.error.emit("No camera found. Check connection and retry.")
             return
 
-        device = system.select_device(devices)
+        # Camera enumerates once per transport (GVCP + TCP); pick the first
+        # and don't fall through to system.select_device(), which prompts on stdin.
+        device = devices[0]
         nm = device.nodemap
         tl = device.tl_stream_nodemap
         width = nm["Width"].value
@@ -174,51 +138,25 @@ class CameraWorker(QThread):
         self.connected.emit(width, height)
         self.status_message.emit(f"Connected: {width}x{height}")
 
-        visualizer = EventVisualizer(width, height)
-        cam_mode = _camera_mode_for(self._mode)
-        saved_evs = self._configure_evs(device, cam_mode)
+        saved_evs = self._configure_evs(device)
         saved_noise = self._configure_noise_filters(device)
         device.start_stream(NUM_BUFFERS)
 
-        prev_noise_dur = self._noise_duration_us
+        # The camera delivers buffers far faster than the GUI can paint, so we
+        # consume every buffer but only render/emit one accumulated frame per
+        # display interval. This keeps raw recording lossless while preventing
+        # the Qt signal queue from backing up (which causes ever-growing lag).
+        display_interval = 1.0 / DISPLAY_FPS
+        last_emit = time.perf_counter()
+        accum: list[np.ndarray] = []
+        last_frame_id = 0
 
         try:
             while True:
-                # Read parameters under lock
                 with QMutexLocker(self._lock):
                     if not self._running:
                         break
-                    mode = self._mode
-                    colormap = self._colormap
-                    sw_noise = self._sw_noise
-                    noise_dur = self._noise_duration_us
-                    mode_changed = self._mode_changed
-                    self._mode_changed = False
-                    pending_bias = self._pending_bias
-                    self._pending_bias = None
 
-                # Handle mode switch requiring camera reconfiguration
-                if mode_changed:
-                    new_cam = _camera_mode_for(mode)
-                    if new_cam != cam_mode:
-                        self.status_message.emit("Reconfiguring stream…")
-                        device.stop_stream()
-                        self._restore_settings(device, saved_evs, saved_noise)
-                        cam_mode = new_cam
-                        saved_evs = self._configure_evs(device, cam_mode)
-                        saved_noise = self._configure_noise_filters(device)
-                        device.start_stream(NUM_BUFFERS)
-
-                # Apply pending bias changes
-                if pending_bias:
-                    self._apply_pending_bias(device, pending_bias)
-
-                # Update noise filter duration if changed
-                if noise_dur != prev_noise_dur:
-                    visualizer.set_noise_duration(noise_dur)
-                    prev_noise_dur = noise_dur
-
-                # Acquire buffer
                 try:
                     buffer = device.get_buffer(timeout=IMAGE_TIMEOUT_MS)
                 except Exception:
@@ -228,24 +166,39 @@ class CameraWorker(QThread):
                     device.requeue_buffer(buffer)
                     continue
 
-                # Grab frame_id before requeue
-                frame_id = buffer.frame_id
-
-                # Render
-                t0 = time.perf_counter()
-                bgr = visualizer.render(buffer, mode, colormap=colormap, sw_noise=sw_noise)
-                render_ms = (time.perf_counter() - t0) * 1000.0
+                last_frame_id = buffer.frame_id
+                events = self._decode_xytp(buffer)
                 device.requeue_buffer(buffer)
 
-                # Read stats (buffer already requeued — use saved frame_id)
+                # Lossless: every buffer is recorded, regardless of display rate.
+                if self.raw_recorder is not None and self.raw_recorder.is_recording:
+                    self.raw_recorder.submit(events)
+
+                accum.append(events)
+
+                now = time.perf_counter()
+                if now - last_emit < display_interval:
+                    continue
+                last_emit = now
+
+                t0 = time.perf_counter()
+                batch = (
+                    np.concatenate(accum)
+                    if accum
+                    else np.empty((0, 4), dtype=np.float32)
+                )
+                accum.clear()
+                bgr, pos_count, neg_count = render_events(batch, width, height)
+                render_ms = (time.perf_counter() - t0) * 1000.0
+
                 stats = {
-                    "mode": mode,
-                    "frame_id": frame_id,
+                    "frame_id": last_frame_id,
                     "event_rate": tl["StreamEvsEventRate"].value,
                     "gvsp_fps": tl["StreamEvsGvspFrameRate"].value,
                     "throughput": tl["StreamEvsLinkThroughput"].value,
                     "render_ms": render_ms,
-                    "noise_on": sw_noise,
+                    "pos_count": pos_count,
+                    "neg_count": neg_count,
                 }
 
                 self.frame_ready.emit(bgr, stats)

@@ -17,13 +17,6 @@ class VideoRecorder:
     def is_recording(self) -> bool:
         return self._writer is not None
 
-    @property
-    def output_dir(self) -> str:
-        return self._output_dir
-
-    def set_output_dir(self, path: str):
-        self._output_dir = path
-
     def start(self, width: int, height: int, fps: float = 30.0):
         os.makedirs(self._output_dir, exist_ok=True)
         ts = datetime.now().strftime("%Y%m%d_%H%M%S")
