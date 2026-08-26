@@ -17,11 +17,6 @@ venv/
 *.swp
 *.swo
 
-# Captures & recordings (binary data artifacts — regenerable, kept out of git)
-evs_captures/
-recordings/
-datasets/
-
 # OS
 .DS_Store
 Thumbs.db

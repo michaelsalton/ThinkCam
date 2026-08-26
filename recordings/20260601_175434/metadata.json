@@ -1,0 +1,32 @@
+{
+  "sensor": "Sony IMX636 (LUCID TRT009S-E)",
+  "resolution": [
+    1280,
+    720
+  ],
+  "timestamp_unit": "raw_sensor_float_unit_TBD",
+  "polarity_encoding": "raw_int8_from_sensor",
+  "recording_start_utc": "2026-06-01T21:54:34Z",
+  "duration_s": 27.703,
+  "event_count": 88178,
+  "biases": {
+    "threshold_positive": 10,
+    "threshold_negative": 10,
+    "refractory_period": 10,
+    "burst_filter": true
+  },
+  "noise_filter": {
+    "background_activity_filter": null,
+    "duration_us": null
+  },
+  "intrinsics": {
+    "fx": null,
+    "fy": null,
+    "cx": null,
+    "cy": null,
+    "distortion": null,
+    "calibrated": false
+  },
+  "operator_notes": "",
+  "take_label": ""
+}
