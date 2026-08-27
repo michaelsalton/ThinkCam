@@ -24,3 +24,6 @@ Thumbs.db
 # ArenaSDK (local install, not part of repo)
 ArenaSDK/
 ArenaSDK_*/
+
+# Phase 1 working data (large, regenerable)
+work/

@@ -1,0 +1,9 @@
+[submodule "external/Event-3DGS"]
+	path = external/Event-3DGS
+	url = https://github.com/lanpokn/Event-3DGS
+[submodule "external/gaussian-splatting"]
+	path = external/gaussian-splatting
+	url = https://github.com/graphdeco-inria/gaussian-splatting
+[submodule "external/rpg_e2vid"]
+	path = external/rpg_e2vid
+	url = https://github.com/uzh-rpg/rpg_e2vid
